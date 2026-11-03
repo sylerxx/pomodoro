@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pomodoro v3</title>
+<title>Pomodoro v4</title>
 <style>
 :root{
   --bg:#101214; --surface:#181b1f; --surface2:#20242a; --line:#2b3038;
@@ -39,7 +39,7 @@ input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px}
 .info .next{color:var(--muted);margin-bottom:16px}
 .subject{display:flex;align-items:center;gap:8px;margin-bottom:16px;color:var(--muted);font-size:13.5px}
 .subject input{flex:0 1 280px}
-input[type=text],input[type=date],input[type=time]{color-scheme:dark;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;height:36px;padding:0 10px}
+input[type=text],input[type=password],input[type=date],input[type=time]{color-scheme:dark;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;height:36px;padding:0 10px}
 .controls{display:flex;gap:10px;flex-wrap:wrap}
 button,select{font:inherit;cursor:pointer;color:var(--ink);background:var(--surface2);border:1px solid var(--line);border-radius:10px;padding:10px 16px;min-height:44px}
 button:hover,select:hover{border-color:var(--accent)}
@@ -129,6 +129,17 @@ td .del{min-height:28px;width:28px;padding:0;color:var(--muted);background:trans
 td .del:hover{color:var(--focus);border-color:var(--line)}
 .empty{color:var(--muted);text-align:center;padding:28px 0;font-size:14px}
 
+/* Sincronização */
+.filebox .err{color:var(--focus)}
+.filebox .full{flex:1 1 100%}
+.syncrow{display:flex;gap:8px;flex:1 1 100%;flex-wrap:wrap}
+.syncrow input{flex:1 1 240px;min-width:0}
+.how{flex:1 1 100%}
+.how summary{cursor:pointer;color:var(--ink)}
+.how ol{margin:8px 0 0;padding-left:20px;line-height:1.65}
+.how a{color:var(--manual)}
+.filebox button:disabled{opacity:.5;cursor:default}
+
 /* Lançamento manual */
 .toolbar button.addbtn{border-color:var(--manual);color:var(--manual);font-weight:600}
 .toolbar button.addbtn.on{background:color-mix(in srgb,var(--manual) 14%,var(--surface2))}
@@ -211,6 +222,7 @@ body.menu-open{overflow:hidden}
           <span id="mMsg" role="status"></span>
         </div>
       </div>
+      <div class="filebox small" id="syncbox"></div>
       <div class="filebox small" id="filebox"></div>
       <div class="hsum">
         <span class="tot" id="hTot">00:00:00</span>
@@ -227,7 +239,7 @@ body.menu-open{overflow:hidden}
       <button id="menuBtn" class="menubtn" aria-expanded="false" aria-controls="menu" title="Histórico, salvar CSV e backup (tecla H)">
         <span class="burger" aria-hidden="true"><i></i><i></i><i></i></span> Histórico <span class="mwarn" id="menuWarn" hidden></span>
       </button>
-      <h1><b>●</b> Pomodoro <small>v3</small></h1>
+      <h1><b>●</b> Pomodoro <small>v4</small></h1>
     </div>
     <div class="opts">
       <label><input type="checkbox" id="optAuto"> Iniciar próximo automaticamente</label>
@@ -314,16 +326,17 @@ body.menu-open{overflow:hidden}
 </div>
 
 <script>
-/* v3 mantém as mesmas chaves de armazenamento da v2: seus dados continuam aparecendo normalmente */
+/* v3 e v4 mantêm as mesmas chaves de armazenamento da v2: seus dados continuam aparecendo normalmente */
 const KEY = 'pomodoro-v2', KEY_V1 = 'pomodoro-horas-liquidas-v1';
 const R = 100, CIRC = 2 * Math.PI * R;
 
 function defaults(){
   return {
-    settings:{ focus:[25,25,25,25], rest:[5,5,5,15], autoStart:true, sound:true, notify:false, subject:'' },
+    settings:{ focus:[25,25,25,25], rest:[5,5,5,15], autoStart:true, sound:true, notify:false, subject:'', durAt:0 },
     run:{ index:0, remaining:null, states:[0,0,0,0,0,0,0,0], cycleMs:0, cur:null },  // states: 0 pendente, 1 concluído, 2 pulado
     stats:{ days:{}, done:{}, totalMs:0, cycles:0 },
-    history:[]   // {id,start,end,block,plannedMin,netMs,status,subject}
+    history:[],  // {id,start,end,block,plannedMin,netMs,status,subject}
+    deleted:{}   // {id: quando} sessões excluídas (a exclusão vale também nos outros aparelhos)
   };
 }
 function merge(s){
@@ -331,6 +344,7 @@ function merge(s){
   if(s){
     for(const k of ['settings','run','stats']) Object.assign(d[k], s[k] || {});
     if(Array.isArray(s.history)) d.history = s.history;
+    if(s.deleted && typeof s.deleted === 'object' && !Array.isArray(s.deleted)) d.deleted = s.deleted;
   }
   return d;
 }
@@ -393,7 +407,15 @@ function closeSession(status, at = Date.now()){
   });
   historyChanged();
 }
-function historyChanged(){ save(); renderHistory(); autoFileWrite(); }
+function historyChanged(fromSync){ save(); renderHistory(); autoFileWrite(); if(!fromSync) scheduleSync(); }
+/* Soma (+1) ou desfaz (-1) o efeito de uma sessão nos totais */
+function statDelta(h, s){
+  const k = dayKey(h.start);
+  st.stats.days[k] = Math.max(0, (st.stats.days[k] || 0) + s * h.netMs);
+  st.stats.totalMs = Math.max(0, st.stats.totalMs + s * h.netMs);
+  const nd = h.imported ? (h.focusCount || 0) : h.status === 'Concluído' ? 1 : 0;
+  if(nd){ const kd = dayKey(h.end); st.stats.done[kd] = Math.max(0, (st.stats.done[kd] || 0) + s * nd); }
+}
 
 /* ---------- Contagem ---------- */
 function credit(ms, at){
@@ -496,6 +518,7 @@ function setMins(i, v, skipRender){
   const old = dur(i);
   listOf(i)[nOf(i)] = v;
   const diff = dur(i) - old;
+  if(diff){ st.settings.durAt = Date.now(); scheduleSync(8000); }
   if(i === st.run.index && diff){
     if(running) endAt = Math.max(Date.now() + 1000, endAt + diff);
     else st.run.remaining = Math.max(1000, st.run.remaining + diff);
@@ -580,9 +603,13 @@ async function autoFileWrite(){
   }catch(e){ fileState = 'err'; }
   renderFileBox();
 }
+function updateWarn(){
+  const w = $('menuWarn'); if(!w) return;
+  w.hidden = !((fileHandle && (fileState === 'perm' || fileState === 'err')) || (sync.token && syncErr));
+}
 function renderFileBox(){
   const box = $('filebox');
-  $('menuWarn').hidden = !(fileHandle && (fileState === 'perm' || fileState === 'err'));
+  updateWarn();
   if(!FSA){ box.innerHTML = 'Para guardar o histórico fora do navegador, use <b>Salvar CSV</b> ou <b>Salvar backup</b>. (O salvamento automático em arquivo funciona no Chrome e no Edge.)'; return; }
   if(!fileHandle){
     box.innerHTML = '<span>Salvamento automático: <b>desligado</b> — escolha um arquivo .csv e ele será atualizado a cada sessão de foco encerrada.</span><button id="fLink">Escolher arquivo…</button>';
@@ -606,6 +633,179 @@ async function initFile(){
     try{ fileState = (await h.queryPermission({ mode:'readwrite' })) === 'granted' ? 'idle' : 'perm'; }catch(e){ fileState = 'perm'; }
   }
   renderFileBox();
+}
+
+/* ---------- Sincronização entre aparelhos (Gist privado do GitHub) ---------- */
+/* O token fica numa chave própria do navegador: nunca entra no backup nem no CSV. */
+const SYNC_KEY = 'pomodoro-sync-v4', SYNC_FILE = 'pomodoro-sync.json', GH = 'https://api.github.com';
+let sync = { token:'', gistId:'', auto:true, last:0 };
+try{ Object.assign(sync, JSON.parse(localStorage.getItem(SYNC_KEY) || '{}')); }catch(e){}
+const syncSave = () => { try{ localStorage.setItem(SYNC_KEY, JSON.stringify(sync)); }catch(e){} };
+let syncBusy = false, syncErr = '', syncStatus = 0, syncInfo = '', syncTimer = 0, syncAgain = false;
+
+function syncNote(){ return sync.token ? '\n\nA sincronização está ligada: isso também será apagado nos seus outros aparelhos.' : ''; }
+function ghError(msg, status){ const e = new Error(msg); e.status = status || 0; return e; }
+async function gh(path, opt = {}){
+  let r;
+  try{
+    r = await fetch(path.startsWith('http') ? path : GH + path, { cache:'no-store', ...opt,
+      headers:{ 'Authorization':'Bearer ' + sync.token, ...(opt.body ? { 'Content-Type':'application/json' } : {}) } });
+  }catch(e){ throw ghError('Sem conexão com o GitHub (verifique a internet).'); }
+  if(!r.ok) throw ghError('GitHub respondeu ' + r.status, r.status);
+  return r.json();
+}
+function explainErr(e){
+  if(e.status === 401) return 'O GitHub recusou o token (inválido ou expirado). Gere outro e conecte de novo.';
+  if(e.status === 403) return 'O GitHub negou o acesso: o token precisa da permissão "gist" (ou o limite de uso foi atingido; tente de novo em alguns minutos).';
+  return e.message || 'Falha ao sincronizar.';
+}
+async function findGist(){
+  const found = [];
+  for(let p = 1; p <= 5; p++){
+    const list = await gh('/gists?per_page=100&page=' + p);
+    list.forEach(g => { if(g.files && g.files[SYNC_FILE]) found.push(g); });
+    if(list.length < 100) break;
+  }
+  found.sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
+  return found[0] || null;
+}
+async function readRemote(id){
+  const g = await gh('/gists/' + id);
+  const f = g.files && g.files[SYNC_FILE];
+  if(!f) return null;
+  let text = f.content;
+  if(f.truncated || text == null){
+    const r = await fetch(f.raw_url, { cache:'no-store' });
+    if(!r.ok) throw ghError('Não foi possível ler o arquivo de sincronização.', r.status);
+    text = await r.text();
+  }
+  try{ return JSON.parse(text); }catch(e){ throw ghError('O arquivo de sincronização no GitHub está corrompido.'); }
+}
+function snapshot(finalSettings){
+  return { app:'pomodoro-sync', version:4, updatedAt:new Date().toISOString(),
+    history:[...st.history].sort((a,b) => a.start - b.start || (a.id < b.id ? -1 : 1)),
+    deleted:st.deleted, settings:finalSettings };
+}
+function sig(o){
+  if(!o) return '';
+  const ids = (Array.isArray(o.history) ? o.history.map(h => h.id) : []).sort().join('|');
+  const del = Object.keys(o.deleted || {}).sort().join('|');
+  const s = o.settings || {};
+  return ids + '#' + del + '#' + (+s.durAt || 0) + '#' + JSON.stringify(s.focus) + JSON.stringify(s.rest);
+}
+function cleanEntry(h){
+  if(!h || typeof h.id !== 'string' || !/^[\w.:-]{1,80}$/.test(h.id)) return null;
+  const n = v => typeof v === 'number' && isFinite(v);
+  if(!n(h.start) || !n(h.end) || !n(h.netMs) || h.netMs < 0 || h.netMs > 172800000) return null;
+  const o = { id:h.id, start:h.start, end:h.end, block:String(h.block || '').slice(0,40),
+    plannedMin:n(h.plannedMin) ? h.plannedMin : null, netMs:Math.round(h.netMs),
+    status:String(h.status || '').slice(0,30), subject:String(h.subject || '').slice(0,120) };
+  if(h.imported){ o.imported = true; o.focusCount = n(h.focusCount) ? h.focusCount : 0; }
+  if(h.manual){ o.manual = true; if(h.noTime) o.noTime = true; }
+  return o;
+}
+const validDur = a => Array.isArray(a) && a.length === 4 && a.every(v => typeof v === 'number' && isFinite(v) && v >= 1 && v <= 240);
+function mergeRemote(remote){
+  let added = 0, removed = 0, durChanged = false;
+  const rd = remote && remote.deleted && typeof remote.deleted === 'object' ? remote.deleted : {};
+  Object.keys(rd).forEach(id => { if(/^[\w.:-]{1,80}$/.test(id) && !(id in st.deleted)) st.deleted[id] = +rd[id] || Date.now(); });
+  st.history = st.history.filter(h => { if(st.deleted[h.id]){ statDelta(h, -1); removed++; return false; } return true; });
+  const have = new Set(st.history.map(h => h.id));
+  (remote && Array.isArray(remote.history) ? remote.history : []).forEach(raw => {
+    const h = cleanEntry(raw);
+    if(!h || have.has(h.id) || st.deleted[h.id]) return;
+    st.history.push(h); have.add(h.id); statDelta(h, 1); added++;
+  });
+  let finalSettings = { focus:st.settings.focus, rest:st.settings.rest, durAt:st.settings.durAt || 0 };
+  const rs = remote && remote.settings;
+  if(rs && +rs.durAt > (st.settings.durAt || 0) && validDur(rs.focus) && validDur(rs.rest)){
+    if(!running){
+      const old = dur(st.run.index);
+      st.settings.focus = rs.focus.map(Math.round); st.settings.rest = rs.rest.map(Math.round); st.settings.durAt = +rs.durAt;
+      const nd = dur(st.run.index);
+      if(st.run.remaining === old || st.run.remaining > nd) st.run.remaining = nd;
+      document.querySelectorAll('input[data-i]').forEach(inp => { inp.value = minsOf(+inp.dataset.i); });
+      finalSettings = { focus:st.settings.focus, rest:st.settings.rest, durAt:st.settings.durAt };
+      durChanged = true;
+    } else finalSettings = { focus:rs.focus, rest:rs.rest, durAt:+rs.durAt };   /* aplica na próxima sincronização */
+  }
+  return { added, removed, durChanged, finalSettings };
+}
+async function syncNow(){
+  if(!sync.token) return;
+  if(syncBusy){ syncAgain = true; return; }
+  syncBusy = true; syncErr = ''; syncStatus = 0; renderSync();
+  try{
+    if(running) tick();
+    let id = sync.gistId, remote = null;
+    if(id){ try{ remote = await readRemote(id); }catch(e){ if(e.status === 404){ id = ''; sync.gistId = ''; } else throw e; } }
+    if(!id){
+      const g = await findGist();
+      if(g){ id = g.id; sync.gistId = id; syncSave(); remote = await readRemote(id); }
+    }
+    const r = remote ? mergeRemote(remote) : { added:0, removed:0, durChanged:false,
+      finalSettings:{ focus:st.settings.focus, rest:st.settings.rest, durAt:st.settings.durAt || 0 } };
+    const snap = snapshot(r.finalSettings);
+    if(!id){
+      const g = await gh('/gists', { method:'POST', body:JSON.stringify({ description:'Pomodoro: dados de sincronização (não apague)', public:false,
+        files:{ [SYNC_FILE]:{ content:JSON.stringify(snap) } } }) });
+      sync.gistId = g.id;
+    } else if(sig(snap) !== sig(remote)){
+      await gh('/gists/' + id, { method:'PATCH', body:JSON.stringify({ files:{ [SYNC_FILE]:{ content:JSON.stringify(snap) } } }) });
+    }
+    sync.last = Date.now(); syncSave();
+    syncInfo = r.added || r.removed ? ' · recebeu ' + r.added + ' sessão(ões)' + (r.removed ? ', removeu ' + r.removed : '') : '';
+    if(r.added || r.removed){ historyChanged(true); render(); } else { save(); if(r.durChanged) render(); }
+  }catch(e){ syncErr = explainErr(e); syncStatus = e.status || 0; }
+  finally{
+    syncBusy = false; renderSync();
+    if(syncAgain){ syncAgain = false; scheduleSync(1500); }
+  }
+}
+function scheduleSync(ms = 3000){
+  if(!sync.token || !sync.auto) return;
+  clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, ms);
+}
+async function connectSync(){
+  const t = $('sTok').value.trim();
+  if(!t){ syncErr = 'Cole o token do GitHub no campo.'; return renderSync(); }
+  sync.token = t; sync.gistId = ''; sync.last = 0; syncSave();
+  await syncNow();
+  if(syncStatus === 401 || syncStatus === 403){ sync.token = ''; syncSave(); renderSync(); }
+}
+function disconnectSync(){
+  if(!confirm('Desconectar a sincronização neste aparelho?\n\nOs dados continuam aqui e no GitHub; só deixam de ser sincronizados.')) return;
+  clearTimeout(syncTimer);
+  sync.token = ''; sync.gistId = ''; sync.last = 0; syncSave(); syncErr = ''; syncInfo = '';
+  renderSync();
+}
+function renderSync(){
+  const box = $('syncbox'); if(!box) return;
+  updateWarn();
+  const err = syncErr ? '<span class="err full">' + esc(syncErr) + '</span>' : '';
+  if(!sync.token){
+    box.innerHTML =
+      '<span class="full"><b>Sincronização entre aparelhos</b> (via GitHub): <span class="warn">desligada</span>. Use o mesmo histórico no PC, no tablet e no celular.</span>' + err +
+      '<div class="syncrow"><input type="password" id="sTok" placeholder="Cole aqui o token do GitHub" autocomplete="off" spellcheck="false" aria-label="Token do GitHub"><button id="sConn">Conectar</button></div>' +
+      '<details class="how"><summary>Como gerar o token (1 minuto)</summary><ol>' +
+      '<li>Abra <a href="https://github.com/settings/tokens/new?scopes=gist&description=Pomodoro%20sync" target="_blank" rel="noopener">esta página do GitHub</a> (faça login se pedir).</li>' +
+      '<li>Confirme que só a caixa <b>gist</b> está marcada e escolha a validade (por exemplo, sem expiração).</li>' +
+      '<li>Clique em <b>Generate token</b> e copie o código (ele só aparece uma vez).</li>' +
+      '<li>Cole acima e clique em <b>Conectar</b>. Em cada aparelho, use o mesmo procedimento: o app encontra seus dados sozinho.</li>' +
+      '</ol><div style="margin-top:6px">O token fica só neste navegador e dá acesso aos seus gists. Não o compartilhe.</div></details>';
+    $('sConn').onclick = connectSync;
+    $('sTok').addEventListener('keydown', e => { if(e.key === 'Enter') connectSync(); });
+    return;
+  }
+  const when = sync.last ? 'última às ' + fmtHM(sync.last) + esc(syncInfo) : 'ainda não sincronizado';
+  box.innerHTML =
+    '<span>Sincronização com o GitHub: <b class="' + (syncErr ? 'warn' : 'ok') + '">' + (syncBusy ? 'sincronizando…' : syncErr ? 'com erro' : 'ligada') + '</b> · ' + when + '</span>' + err +
+    '<button id="sNow"' + (syncBusy ? ' disabled' : '') + '>Sincronizar agora</button>' +
+    '<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="sAuto"' + (sync.auto ? ' checked' : '') + '> automática</label>' +
+    '<button id="sOff">Desconectar</button>';
+  $('sNow').onclick = () => syncNow();
+  $('sAuto').onchange = e => { sync.auto = e.target.checked; syncSave(); if(sync.auto) scheduleSync(500); };
+  $('sOff').onclick = disconnectSync;
 }
 
 /* ---------- Montagem da interface ---------- */
@@ -740,8 +940,8 @@ function renderHistory(){
     html += rows.map(h =>
       '<tr><td class="n">'+((h.imported || h.noTime) ? '—' : fmtHM(h.start)+'–'+fmtHM(h.end))+'</td><td>'+esc(h.block)+'</td><td>'+(h.subject ? esc(h.subject) : '<span style="color:var(--muted)">—</span>')+'</td>'+
       '<td class="n hide-sm">'+(h.plannedMin == null ? '—' : h.plannedMin+' min')+'</td><td class="n">'+fmtHMS(h.netMs)+'</td>'+
-      '<td><span class="badge '+(h.status==='Concluído'?'ok':h.status==='Interrompido'?'int':h.status==='Manual'?'man':'')+'">'+h.status+'</span></td>'+
-      '<td><button class="del" data-del="'+h.id+'" title="Excluir esta sessão">×</button></td></tr>').join('');
+      '<td><span class="badge '+(h.status==='Concluído'?'ok':h.status==='Interrompido'?'int':h.status==='Manual'?'man':'')+'">'+esc(h.status)+'</span></td>'+
+      '<td><button class="del" data-del="'+esc(h.id)+'" title="Excluir esta sessão">×</button></td></tr>').join('');
   }
   html += '</tbody></table>';
   if(list.length > MAX) html += '<div class="empty">Mostrando as ' + MAX + ' sessões mais recentes. Use "Salvar CSV" para ver todas.</div>';
@@ -749,13 +949,10 @@ function renderHistory(){
 }
 function deleteSession(id){
   const h = st.history.find(x => x.id === id);
-  if(!h || !confirm('Excluir a sessão de ' + fmtDate(h.start) + ' ' + fmtHM(h.start) + ' (' + fmtHMS(h.netMs) + ')? O tempo também sai do somatório.')) return;
+  if(!h || !confirm('Excluir a sessão de ' + fmtDate(h.start) + ' ' + fmtHM(h.start) + ' (' + fmtHMS(h.netMs) + ')? O tempo também sai do somatório.' + syncNote())) return;
   st.history = st.history.filter(x => x.id !== id);
-  const k = dayKey(h.start);
-  st.stats.days[k] = Math.max(0, (st.stats.days[k] || 0) - h.netMs);
-  st.stats.totalMs = Math.max(0, st.stats.totalMs - h.netMs);
-  const nd = h.imported ? (h.focusCount || 0) : h.status === 'Concluído' ? 1 : 0;
-  if(nd){ const kd = dayKey(h.end); st.stats.done[kd] = Math.max(0, (st.stats.done[kd] || 0) - nd); }
+  st.deleted[id] = Date.now();
+  statDelta(h, -1);
   historyChanged(); render();
 }
 
@@ -785,18 +982,20 @@ $('optNotify').onchange = async e => {
   save();
 };
 $('rToday').onclick = () => {
-  if(!confirm('Zerar as horas de hoje? As sessões de hoje também saem do histórico.')) return;
+  if(!confirm('Zerar as horas de hoje? As sessões de hoje também saem do histórico.' + syncNote())) return;
   if(running) tick();
   const k = dayKey(Date.now()), ms = st.stats.days[k] || 0;
   st.stats.totalMs = Math.max(0, st.stats.totalMs - ms);
   delete st.stats.days[k]; delete st.stats.done[k];
+  st.history.filter(h => dayKey(h.start) === k).forEach(h => { st.deleted[h.id] = Date.now(); });
   st.history = st.history.filter(h => dayKey(h.start) !== k);
   st.run.cycleMs = 0; if(st.run.cur) st.run.cur.netMs = 0;
   historyChanged(); render();
 };
 $('rAll').onclick = () => {
-  if(!confirm('Apagar TODO o somatório e o histórico de tempos? Dica: use "Salvar backup" antes.')) return;
+  if(!confirm('Apagar TODO o somatório e o histórico de tempos? Dica: use "Salvar backup" antes.' + syncNote())) return;
   if(running) tick();
+  st.history.forEach(h => { st.deleted[h.id] = Date.now(); });
   st.stats = defaults().stats; st.history = []; st.run.cycleMs = 0; if(st.run.cur) st.run.cur.netMs = 0;
   historyChanged(); render();
 };
@@ -809,7 +1008,7 @@ $('expCsv').onclick = () => {
 };
 $('expJson').onclick = () => {
   if(running) tick();
-  download('backup-pomodoro_' + stamp() + '.json', JSON.stringify({ app:'pomodoro', version:3, savedAt:new Date().toISOString(), ...st, run:{ ...st.run } }, null, 2), 'application/json');
+  download('backup-pomodoro_' + stamp() + '.json', JSON.stringify({ app:'pomodoro', version:4, savedAt:new Date().toISOString(), ...st, run:{ ...st.run } }, null, 2), 'application/json');
 };
 $('impJson').onclick = () => $('impFile').click();
 $('impFile').onchange = async e => {
@@ -856,9 +1055,7 @@ function addManual(){
     start, end: start + netMs, block:'Manual', plannedMin:null, netMs,
     status:'Manual', subject: act, manual:true, noTime
   });
-  const k = dayKey(start);
-  st.stats.days[k] = (st.stats.days[k] || 0) + netMs;
-  st.stats.totalMs += netMs;
+  statDelta(st.history[st.history.length - 1], 1);
   /* garante que o lançamento apareça na lista (amplia o período e limpa o filtro, se preciso) */
   const back = Math.round((dayStart(Date.now()) - dayStart(start)) / 86400000);
   const need = back <= 0 ? 'today' : back <= 6 ? '7' : back <= 29 ? '30' : 'all', ord = ['today','7','30','all'];
@@ -896,6 +1093,8 @@ document.addEventListener('keydown', e => {
 });
 window.addEventListener('beforeunload', () => { if(running){ tick(); st.run.remaining = Math.max(1000, endAt - Date.now()); } save(); });
 document.addEventListener('visibilitychange', tick);
+document.addEventListener('visibilitychange', () => { if(!document.hidden && sync.token && sync.auto && Date.now() - sync.last > 20000) syncNow(); });
+setInterval(() => { if(!document.hidden && sync.token && sync.auto && Date.now() - sync.last > 110000) syncNow(); }, 30000);
 
 /* Relógio: worker (não é desacelerado em abas em segundo plano) + intervalo de reserva */
 try{
@@ -905,7 +1104,8 @@ try{
 setInterval(tick, 500);
 
 $('prog').style.strokeDasharray = CIRC;
-buildCards(); buildPresets(); render(); renderHistory(); initFile();
+buildCards(); buildPresets(); render(); renderHistory(); initFile(); renderSync();
+setTimeout(() => { if(sync.token && sync.auto) syncNow(); }, 1500);
 </script>
 </body>
 </html>
